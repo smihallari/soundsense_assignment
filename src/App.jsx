@@ -442,7 +442,22 @@ function analyzeCallAndRules(call, turns) {
       evidence: timeWindowTurn.turnId,
     });
   }
+  // Check 12: Private Entity Redaction vs Allowed Advice Bodies
+  const ALLOWED_ENTITIES =
+    /\b(StepChange|Citizens Advice|Money\s*Helper|National Debtline|PayPlan|October|November|December|January|February|March|April|May|June|July|August|September|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|DPA|I&E|UK)\b/gi;
+  const scrubbedSummary = summary.replace(ALLOWED_ENTITIES, "");
 
+  const entityLeakMatch = scrubbedSummary.match(
+    /\b(?:works?\s+(?:at|for)|employed\s+by|job\s+at|garage\s+called|repaired\s+at|shopped\s+at|bank\s+with)\s+([A-Z][a-zA-Z0-9&'\s-]{2,20})/
+  );
+  if (entityLeakMatch) {
+    warnings.push({
+      severity: "definite",
+      rule: "Rule 3: Private Entity Leak",
+      message: `Summary appears to name a specific employer, garage, or private entity ("${entityLeakMatch[0].trim()}"). Redact private entities while keeping StepChange/Citizens Advice.`,
+      evidence: "Summary",
+    });
+  }
   return {
     inferredDirection,
     detectedCustomer,
@@ -668,6 +683,10 @@ export default function App() {
       id: c.id,
       call_date: c.call_date,
       status: reviews[c.id]?.status || "Pending",
+      confidence:
+        reviews[c.id]?.status === "Rejected"
+          ? reviews[c.id]?.confidence || "Definite Error"
+          : "N/A",
       failure_reasons: reviews[c.id]?.reasons || [],
       notes: reviews[c.id]?.notes || "",
       updated_at: reviews[c.id]?.updatedAt || null,
@@ -1095,39 +1114,65 @@ export default function App() {
                 ✕ Reject Summary
               </button>
             </div>
-
-            {/* Failure Reason Checkboxes (Visible when Rejected) */}
+            
             {currentReview.status === "Rejected" && (
-              <div className="w-full grid grid-cols-1 md:grid-cols-3 gap-2.5 bg-rose-50/70 border border-rose-200 p-2.5 rounded-lg">
-                {QA_WORKFLOW_STAGES.map((group) => (
-                  <div
-                    key={group.stage}
-                    className="bg-white/90 border border-rose-200/80 rounded p-2"
-                  >
-                    <div className="text-[10px] font-bold uppercase tracking-wider text-rose-900 mb-1.5 border-b border-rose-100 pb-1">
-                      {group.stage}
+              <div className="w-full space-y-2.5">
+                {/* Failure Reason Checkboxes */}
+                <div className="w-full grid grid-cols-1 md:grid-cols-3 gap-2.5 bg-rose-50/70 border border-rose-200 p-2.5 rounded-lg">
+                  {QA_WORKFLOW_STAGES.map((group) => (
+                    <div
+                      key={group.stage}
+                      className="bg-white/90 border border-rose-200/80 rounded p-2"
+                    >
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-rose-900 mb-1.5 border-b border-rose-100 pb-1">
+                        {group.stage}
+                      </div>
+                      <div className="space-y-1">
+                        {group.items.map((reason) => {
+                          const checked = (currentReview.reasons || []).includes(reason);
+                          return (
+                            <label
+                              key={reason}
+                              className="flex items-start gap-1.5 text-[11px] text-slate-800 font-medium cursor-pointer select-none leading-tight"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleReason(reason)}
+                                className="mt-0.5 rounded border-rose-300 text-rose-600 focus:ring-rose-500"
+                              />
+                              <span>{reason}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
                     </div>
-                    <div className="space-y-1">
-                      {group.items.map((reason) => {
-                        const checked = (currentReview.reasons || []).includes(reason);
-                        return (
-                          <label
-                            key={reason}
-                            className="flex items-start gap-1.5 text-[11px] text-slate-800 font-medium cursor-pointer select-none leading-tight"
-                          >
-                            <input
-                              type="checkbox"
-                              checked={checked}
-                              onChange={() => toggleReason(reason)}
-                              className="mt-0.5 rounded border-rose-300 text-rose-600 focus:ring-rose-500"
-                            />
-                            <span>{reason}</span>
-                          </label>
-                        );
-                      })}
+                  ))}
+                </div>
+
+                {/* QA Confidence / Severity Selector */}
+                <div className="bg-amber-50/90 border border-amber-300 rounded-lg p-3 flex items-center justify-between gap-3 shadow-2xs">
+                  <div>
+                    <div className="text-xs font-bold text-amber-900 uppercase tracking-wider">
+                      Evaluation Severity
                     </div>
+                    <p className="text-[11px] text-amber-800">
+                      Distinguish a definite rule breach from transcript ambiguity or uncertainty.
+                    </p>
                   </div>
-                ))}
+                  <select
+                    value={currentReview.confidence || "Definite Error"}
+                    onChange={(e) =>
+                      updateCurrentReview({ confidence: e.target.value })
+                    }
+                    className="text-xs font-semibold px-3 py-1.5 rounded border border-amber-400 bg-white text-amber-950 focus:outline-none focus:ring-2 focus:ring-amber-300 cursor-pointer shadow-2xs"
+                  >
+                    <option value="Definite Error">🔴 Definite Error</option>
+                    <option value="Uncertain / Ambiguous">
+                      🟡 Uncertain / Transcript Ambiguous
+                    </option>
+                  </select>
+                </div>
               </div>
             )}
 
