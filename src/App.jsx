@@ -3,13 +3,33 @@ import rawCallsData from "./candidate-calls.json";
 
 const STORAGE_KEY = "qa_review_verdicts_v1";
 
-const FAILURE_REASONS = [
-  "Hallucinated Fact",
-  "Proposal vs Agreement Confusion",
-  "Missing Action Item",
-  "Wrong Number/Date",
-  "Rule / Protocol Breach",
-  "Contradicts Transcript",
+const QA_WORKFLOW_STAGES = [
+  {
+    stage: "1. Gatekeeper & Context",
+    items: [
+      "Wrong Call Direction / Outcome",
+      "DPA Status Error (Partial or Missing)",
+      "3rd-Party Authority / Voicemail Error",
+    ],
+  },
+  {
+    stage: "2. Ground-Truth Alignment",
+    items: [
+      "Hallucinated / Contradicted Fact",
+      "Proposal vs Agreement Confusion",
+      "Wrong Date / Time Window Drift",
+      "Missing Next Step / Action Item",
+    ],
+  },
+  {
+    stage: "3. Selective Redaction & Protocol",
+    items: [
+      "Leaked Forbidden Amount (Arrears / Payment)",
+      "Leaked PII / Private Entity Name",
+      "Missing Mandatory Phrase (Consent / Signpost / I&E)",
+      "Used Banned Omission / 'Further Action' Term",
+    ],
+  },
 ];
 
 const STOP_WORDS = new Set([
@@ -149,6 +169,42 @@ function parseSummaryCards(summaryRaw) {
     };
   });
 }
+
+
+function resolveRelativeDates(callDateStr) {
+  if (!callDateStr) return null;
+  const base = new Date(`${callDateStr}T12:00:00Z`);
+  if (isNaN(base.getTime())) return null;
+
+  const fmt = (d) =>
+    d.toLocaleDateString("en-GB", {
+      day: "numeric",
+      month: "short",
+      timeZone: "UTC",
+    });
+
+  const dayNames = [
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+  ];
+  const baseDayName = dayNames[base.getUTCDay()];
+
+  const tomorrow = new Date(base);
+  tomorrow.setUTCDate(base.getUTCDate() + 1);
+
+  const upcomingWeekdays = {};
+  for (let offset = 1; offset <= 7; offset++) {
+    const d = new Date(base);
+    d.setUTCDate(base.getUTCDate() + offset);
+    upcomingWeekdays[dayNames[d.getUTCDay()]] = fmt(d);
+  }
+
+  return {
+    callDay: `${baseDayName}, ${fmt(base)}`,
+    tomorrow: fmt(tomorrow),
+    upcomingWeekdays,
+  };
+}
+
 
 // Extract metadata & run deterministic checks from summary-rules.txt
 function analyzeCallAndRules(call, turns) {
@@ -305,12 +361,95 @@ function analyzeCallAndRules(call, turns) {
     )
   );
 
+  const resolvedDates = resolveRelativeDates(call.call_date);
+
+  // Check 8: Partial DPA Trap (Name + DOB + Address/Postcode all required unless pre-call security stated)
+  const earlyTranscript = turns.slice(0, 10).map((t) => t.text).join(" ");
+  const hasPreCallSec = /pre-call security|already passed security|security before transfer/i.test(earlyTranscript);
+  const hasDOB = /\b(19\d{2}|20\d{2}|eighty|ninety|seventy|sixty|date of birth)\b/i.test(earlyTranscript);
+  const hasPostcodeOrAddress = /\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}|street|road|close|lane|avenue|drive|way|court|crescent)\b/i.test(earlyTranscript);
+
+  if (
+    summaryLower.includes("dpa completed") &&
+    !hasPreCallSec &&
+    (!hasDOB || !hasPostcodeOrAddress)
+  ) {
+    warnings.push({
+      rule: "Step 1: Partial DPA Trap",
+      message:
+        'Summary claims "DPA completed", but transcript appears to be missing either DOB or Address/Postcode verification.',
+      evidence: "T03",
+    });
+  }
+
+  // Check 9: Forbidden Arrears/Balance or Immediate Payment Amounts
+  const summarySentences = summary.split(/(?<=[.!?])\s+/);
+  summarySentences.forEach((sentence) => {
+    const sLow = sentence.toLowerCase();
+    const hasCurrency = /£\d+|\b\d+\s*pounds\b/i.test(sentence);
+    if (!hasCurrency) return;
+
+    if (/\b(arrears|balance|overdue|owed)\b/i.test(sLow) && !/\b(income|pay|rent|repair|cost|drop|reduced)\b/i.test(sLow)) {
+      warnings.push({
+        rule: "Financial Rule: Forbidden Arrears/Balance Amount",
+        message: `Summary includes a specific amount alongside arrears/balance ("${sentence.trim()}"). Must only state arrears/balance were discussed.`,
+        evidence: "Summary",
+      });
+    }
+    if (/\b(payment made|paid today|immediate payment|took a payment|payment of)\b/i.test(sLow)) {
+      warnings.push({
+        rule: "Financial Rule: Forbidden Immediate Payment Amount",
+        message: `Summary includes a specific amount for an immediate payment ("${sentence.trim()}"). Must only state "Payment made."`,
+        evidence: "Summary",
+      });
+    }
+  });
+
+  // Check 10: Banned Omission Phrases & Prohibited 'Further Action' in Next Steps
+  const bannedOmissionMatch = summary.match(
+    /\b(not discussed|n\/a|not applicable|not completed|none discussed|not mentioned)\b/i
+  );
+  if (bannedOmissionMatch) {
+    warnings.push({
+      rule: "Rule 1: Critical Omission Breach",
+      message: `Summary uses banned negative reporting phrase "${bannedOmissionMatch[0]}". Omit undiscussed categories entirely.`,
+      evidence: "Summary",
+    });
+  }
+
+  if (
+    summaryLower.includes("further action") &&
+    !summaryLower.includes("risk of further action")
+  ) {
+    warnings.push({
+      rule: "Rule 6 & Step 9: Prohibited 'Further Action' Phrase",
+      message:
+        'Summary uses "further action" outside the mandatory warning phrase "risk of further action". Use "next steps" for future plans.',
+      evidence: "Summary",
+    });
+  }
+
+  // Check 11: Time Window Precision Drift ("after/before X" -> "at X")
+  const timeWindowTurn = turns.find((t) =>
+    /\b(after|before|around|between)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})\b/i.test(
+      t.text
+    )
+  );
+  if (timeWindowTurn && /\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(summary)) {
+    warnings.push({
+      rule: "Rule 4: Time Window Precision Drift",
+      message: `Transcript (${timeWindowTurn.turnId}) specifies a relative window ("after/before/around"), but summary converts it to an exact "at [time]" appointment.`,
+      evidence: timeWindowTurn.turnId,
+    });
+  }
+
   return {
     inferredDirection,
     detectedCustomer,
     warnings,
     hallucinationTurnId: hallucinationTurn ? hallucinationTurn.turnId : null,
     fullTranscript,
+    resolvedDates,
   };
 }
 
@@ -678,6 +817,23 @@ export default function App() {
                       Call Date: {selectedCall.call_date}
                     </span>
                   </div>
+                  {diagnostics.resolvedDates && (
+                  <div className="w-full mt-2 pt-2 border-t border-slate-100 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-600">
+                    <span className="font-semibold text-slate-800">
+                      Anchor ({diagnostics.resolvedDates.callDay}):
+                    </span>
+                    <span className="bg-slate-100 px-1.5 py-0.5 rounded">
+                      Tomorrow = <strong>{diagnostics.resolvedDates.tomorrow}</strong>
+                    </span>
+                    {Object.entries(diagnostics.resolvedDates.upcomingWeekdays).map(
+                      ([day, dateStr]) => (
+                        <span key={day} className="bg-slate-100 px-1.5 py-0.5 rounded">
+                          {day.slice(0, 3)} = <strong>{dateStr}</strong>
+                        </span>
+                      )
+                    )}
+                  </div>
+                )}
                   <p className="text-xs text-slate-500 mt-0.5">
                     Click any sentence or action card below to highlight related
                     transcript evidence.
@@ -942,29 +1098,36 @@ export default function App() {
 
             {/* Failure Reason Checkboxes (Visible when Rejected) */}
             {currentReview.status === "Rejected" && (
-              <div className="flex flex-wrap items-center gap-3 bg-rose-50/80 border border-rose-200 px-3 py-2 rounded">
-                <span className="text-[11px] font-bold text-rose-900 uppercase">
-                  Failure Reasons:
-                </span>
-                {FAILURE_REASONS.map((reason) => {
-                  const checked = (currentReview.reasons || []).includes(
-                    reason
-                  );
-                  return (
-                    <label
-                      key={reason}
-                      className="inline-flex items-center gap-1.5 text-xs text-rose-950 font-medium cursor-pointer select-none"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggleReason(reason)}
-                        className="rounded border-rose-300 text-rose-600 focus:ring-rose-500"
-                      />
-                      <span>{reason}</span>
-                    </label>
-                  );
-                })}
+              <div className="w-full grid grid-cols-1 md:grid-cols-3 gap-2.5 bg-rose-50/70 border border-rose-200 p-2.5 rounded-lg">
+                {QA_WORKFLOW_STAGES.map((group) => (
+                  <div
+                    key={group.stage}
+                    className="bg-white/90 border border-rose-200/80 rounded p-2"
+                  >
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-rose-900 mb-1.5 border-b border-rose-100 pb-1">
+                      {group.stage}
+                    </div>
+                    <div className="space-y-1">
+                      {group.items.map((reason) => {
+                        const checked = (currentReview.reasons || []).includes(reason);
+                        return (
+                          <label
+                            key={reason}
+                            className="flex items-start gap-1.5 text-[11px] text-slate-800 font-medium cursor-pointer select-none leading-tight"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleReason(reason)}
+                              className="mt-0.5 rounded border-rose-300 text-rose-600 focus:ring-rose-500"
+                            />
+                            <span>{reason}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
 
